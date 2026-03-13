@@ -91,6 +91,30 @@ dask_scheduler_prefix_state_totals_total
     Accumulated count of task prefix in each state
 dask_scheduler_tick_count_total
     Total number of ticks observed since the server started
+dask_scheduler_transitions_total
+    Total number of scheduler task transitions processed
+dask_scheduler_queue_slots_opened_total
+    Total number of worker task slots observed as available when the scheduler
+    attempts to drain the queued task heap
+dask_scheduler_queued_tasks_dispatched_total
+    Total number of queued tasks transitioned to ``processing`` by the scheduler
+dask_scheduler_compute_task_messages_total
+    Total number of scheduler-to-worker compute-task messages sent
+dask_scheduler_compute_task_dispatches_total
+    Total number of tasks dispatched by the scheduler to workers
+dask_scheduler_compute_task_locality_hits_total
+    Total number of dispatched tasks whose dependencies were already local on the
+    assigned worker
+dask_scheduler_task_finished_messages_total
+    Total number of ``task-finished`` messages handled by the scheduler
+dask_scheduler_task_finished_tasks_total
+    Total number of completed tasks handled by the scheduler
+dask_scheduler_queue_delay_seconds_total
+    Total cumulative time tasks spent waiting in the scheduler queue
+dask_scheduler_queue_delay_samples_total
+    Total number of queued tasks for which queue delay was recorded
+dask_scheduler_queue_delay_maximum_seconds
+    Maximum single observed time a task spent waiting in the scheduler queue
 dask_scheduler_tick_duration_maximum_seconds
     Maximum tick duration observed since Prometheus last scraped metrics.
     If this is significantly higher than what's configured in

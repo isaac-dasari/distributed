@@ -211,6 +211,73 @@ class SchedulerMetricCollector(PrometheusCollector):
             value=self.server._tick_counter,
         )
 
+        yield CounterMetricFamily(
+            self.build_name("transitions_total"),
+            "Total number of scheduler task transitions processed",
+            value=self.server.transition_counter,
+        )
+
+        yield CounterMetricFamily(
+            self.build_name("queue_slots_opened_total"),
+            "Total number of worker task slots observed as available when draining the scheduler queue",
+            value=self.server.queue_slots_opened_total,
+        )
+
+        yield CounterMetricFamily(
+            self.build_name("queued_tasks_dispatched_total"),
+            "Total number of queued tasks transitioned to processing by the scheduler",
+            value=self.server.queued_tasks_dispatched_total,
+        )
+
+        yield CounterMetricFamily(
+            self.build_name("compute_task_messages_total"),
+            "Total number of scheduler-to-worker compute-task messages sent",
+            value=self.server.compute_task_messages_total,
+        )
+
+        yield CounterMetricFamily(
+            self.build_name("compute_task_dispatches_total"),
+            "Total number of tasks dispatched by the scheduler to workers",
+            value=self.server.compute_task_dispatches_total,
+        )
+
+        yield CounterMetricFamily(
+            self.build_name("compute_task_locality_hits_total"),
+            "Total number of dispatched tasks whose dependencies were already local on the assigned worker",
+            value=self.server.compute_task_locality_hits_total,
+        )
+
+        yield CounterMetricFamily(
+            self.build_name("task_finished_messages_total"),
+            "Total number of task-finished messages handled by the scheduler",
+            value=self.server.task_finished_messages_total,
+        )
+
+        yield CounterMetricFamily(
+            self.build_name("task_finished_tasks_total"),
+            "Total number of completed tasks handled by the scheduler",
+            value=self.server.task_finished_tasks_total,
+        )
+
+        yield CounterMetricFamily(
+            self.build_name("queue_delay_seconds_total"),
+            "Total cumulative time tasks spent waiting in the scheduler queue",
+            value=self.server.queue_delay_seconds_total,
+            unit="seconds",
+        )
+
+        yield CounterMetricFamily(
+            self.build_name("queue_delay_samples_total"),
+            "Total number of queued tasks for which queue delay was recorded",
+            value=self.server.queue_delay_samples_total,
+        )
+
+        yield GaugeMetricFamily(
+            self.build_name("queue_delay_maximum_seconds"),
+            "Maximum single observed time a task spent in the scheduler queue",
+            value=self.server.queue_delay_max,
+        )
+
         self.server.digests_max.clear()
 
 

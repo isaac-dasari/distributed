@@ -208,6 +208,17 @@ properties:
 
               Over time the scheduler will learn these values, but these give it a good starting point.
 
+          batching:
+            type: object
+            description: |
+              Configuration for scheduler-side semantic batching.
+            properties:
+              compute:
+                type: boolean
+                description: |
+                  Whether to pack multiple compute-task messages for the same worker
+                  into a single semantic compute-task-batch message.
+
           validate:
             type: boolean
             description: |
@@ -408,6 +419,28 @@ properties:
               Arguments to pass into the preload scripts described above
 
               See https://docs.dask.org/en/latest/how-to/customize-initialization.html for more information
+
+          batching:
+            type: object
+            description: |
+              Configuration for worker-side semantic batching.
+            properties:
+              task-finished:
+                type: boolean
+                description: |
+                  Whether to buffer multiple task-finished messages and send them as
+                  a single task-finished-batch message to the scheduler.
+              task-finished-size:
+                type: integer
+                minimum: 1
+                description: |
+                  Maximum number of completed tasks to accumulate before immediately
+                  sending a task-finished-batch message.
+              task-finished-interval:
+                type: string
+                description: |
+                  Maximum amount of time to wait before flushing a partial
+                  task-finished batch to the scheduler.
 
           daemon:
             type: boolean

@@ -675,6 +675,18 @@ class Worker(BaseWorker, ServerNode):
         self.batched_stream = BatchedSend(interval="2ms", loop=self.loop)
         self.scheduler_delay = 0
         self.stream_comms = {}
+        self.task_finished_batch_enabled = dask.config.get(
+            "distributed.worker.batching.task-finished"
+        )
+        self.task_finished_batch_size = dask.config.get(
+            "distributed.worker.batching.task-finished-size"
+        )
+        self.task_finished_batch_interval = parse_timedelta(
+            dask.config.get("distributed.worker.batching.task-finished-interval"),
+            default="ms",
+        )
+        self._task_finished_batch_buffer: list[dict[str, Any]] = []
+        self._task_finished_batch_call = None
 
         self.plugins = {}
         self._pending_plugins = plugins
@@ -727,6 +739,7 @@ class Worker(BaseWorker, ServerNode):
             "cancel-compute": self._handle_remote_stimulus(CancelComputeEvent),
             "acquire-replicas": self._handle_remote_stimulus(AcquireReplicasEvent),
             "compute-task": self._handle_remote_stimulus(ComputeTaskEvent),
+            "compute-task-batch": self._handle_compute_task_batch,
             "free-keys": self._handle_remote_stimulus(FreeKeysEvent),
             "remove-replicas": self._handle_remote_stimulus(RemoveReplicasEvent),
             "steal-request": self._handle_remote_stimulus(StealRequestEvent),
@@ -1175,12 +1188,45 @@ class Worker(BaseWorker, ServerNode):
         --------
         distributed.worker_state_machine.BaseWorker.batched_send
         """
+        if self.task_finished_batch_enabled and msg.get("op") == "task-finished":
+            self._task_finished_batch_buffer.append(msg)
+            if len(self._task_finished_batch_buffer) >= self.task_finished_batch_size:
+                self._flush_task_finished_batch()
+            elif self._task_finished_batch_call is None:
+                self._task_finished_batch_call = self.loop.call_later(
+                    self.task_finished_batch_interval,
+                    self._flush_task_finished_batch,
+                )
+            return
+
+        if self._task_finished_batch_buffer:
+            self._flush_task_finished_batch()
+
         if (
             self.batched_stream
             and self.batched_stream.comm
             and not self.batched_stream.comm.closed()
         ):
             self.batched_stream.send(msg)
+
+    def _flush_task_finished_batch(self) -> None:
+        if self._task_finished_batch_call is not None:
+            self._task_finished_batch_call.cancel()
+            self._task_finished_batch_call = None
+        if not self._task_finished_batch_buffer:
+            return
+
+        batch = self._task_finished_batch_buffer
+        self._task_finished_batch_buffer = []
+        if (
+            self.batched_stream
+            and self.batched_stream.comm
+            and not self.batched_stream.comm.closed()
+        ):
+            if len(batch) == 1:
+                self.batched_stream.send(batch[0])
+            else:
+                self.batched_stream.send({"op": "task-finished-batch", "tasks": batch})
 
     async def _register_with_scheduler(self) -> None:
         self.periodic_callbacks["keep-alive"].stop()
@@ -1632,6 +1678,7 @@ class Worker(BaseWorker, ServerNode):
         if self._protocol.startswith("ucx"):  # pragma: no cover
             await asyncio.sleep(0.2)
 
+        self._flush_task_finished_batch()
         self.batched_send({"op": "close-stream"})
 
         if self.batched_stream:
@@ -1948,6 +1995,12 @@ class Worker(BaseWorker, ServerNode):
 
         _.__name__ = f"_handle_remote_stimulus({cls.__name__})"
         return _
+
+    def _handle_compute_task_batch(
+        self, tasks: list[dict[str, Any]], **kwargs: Any
+    ) -> None:
+        events = [ComputeTaskEvent(**{k: v for k, v in task.items() if k != "op"}) for task in tasks]
+        self.handle_stimulus(*events)
 
     @fail_hard
     def handle_stimulus(self, *stims: StateMachineEvent) -> None:

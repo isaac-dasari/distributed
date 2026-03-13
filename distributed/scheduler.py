@@ -1684,6 +1684,9 @@ class SchedulerState:
     #: Tasks in the "queued" state, ordered by priority
     queued: HeapSet[TaskState]
 
+    #: Monotonic timestamps for tasks currently in the queued state
+    queued_since: dict[TaskState, float]
+
     #: Tasks in the "no-worker" state with the (monotonic) time when they became unrunnable
     unrunnable: dict[TaskState, float]
 
@@ -1718,6 +1721,39 @@ class SchedulerState:
 
     #: Total number of transitions as of the previous call to check_idle()
     _idle_transition_counter: int
+
+    #: Total number of worker task slots observed as available while draining the queue
+    queue_slots_opened_total: int
+
+    #: Total number of queued tasks transitioned to processing
+    queued_tasks_dispatched_total: int
+
+    #: Total number of scheduler-to-worker compute-task messages sent
+    compute_task_messages_total: int
+
+    #: Total number of tasks dispatched by the scheduler to workers
+    compute_task_dispatches_total: int
+
+    #: Total number of dispatched tasks whose dependencies were already local
+    compute_task_locality_hits_total: int
+
+    #: Total number of task-finished messages handled
+    task_finished_messages_total: int
+
+    #: Total number of completed tasks handled
+    task_finished_tasks_total: int
+
+    #: Total cumulative queue delay across all tasks that left the queued state
+    queue_delay_seconds_total: float
+
+    #: Number of queued tasks for which queue delay was recorded
+    queue_delay_samples_total: int
+
+    #: Maximum single observed queue delay
+    queue_delay_max: float
+
+    #: Whether semantic compute-task batching is enabled
+    compute_task_batch_enabled: bool
 
     #: Raise an error if the :attr:`transition_counter` ever reaches this value.
     #: This is meant for debugging only, to catch infinite recursion loops.
@@ -1791,6 +1827,7 @@ class SchedulerState:
         self.total_nthreads = 0
         self.total_nthreads_history = [(time(), 0)]
         self.queued = queued
+        self.queued_since = {}
         self.unrunnable = unrunnable
         self.validate = validate
         self.workers = workers
@@ -1806,6 +1843,19 @@ class SchedulerState:
         )
         self.transition_counter = 0
         self._idle_transition_counter = 0
+        self.queue_slots_opened_total = 0
+        self.queued_tasks_dispatched_total = 0
+        self.compute_task_messages_total = 0
+        self.compute_task_dispatches_total = 0
+        self.compute_task_locality_hits_total = 0
+        self.task_finished_messages_total = 0
+        self.task_finished_tasks_total = 0
+        self.queue_delay_seconds_total = 0.0
+        self.queue_delay_samples_total = 0
+        self.queue_delay_max = 0.0
+        self.compute_task_batch_enabled = dask.config.get(
+            "distributed.scheduler.batching.compute"
+        )
         self.transition_counter_max = transition_counter_max
 
         # Variables from dask.config, cached by __init__ for performance
@@ -2272,6 +2322,7 @@ class SchedulerState:
             assert not ts.processing_on
 
         self.queued.remove(ts)
+        self.queued_since.pop(ts, None)
 
         return self._propagate_erred(
             ts,
@@ -2931,6 +2982,7 @@ class SchedulerState:
 
         ts.state = "queued"
         self.queued.add(ts)
+        self.queued_since[ts] = monotonic()
 
         return {}, {}, {}
 
@@ -2957,6 +3009,7 @@ class SchedulerState:
             assert not ts.processing_on
 
         self.queued.remove(ts)
+        self.queued_since.pop(ts, None)
 
         recommendations: Recs = {}
         self._propagate_released(ts, recommendations)
@@ -2971,6 +3024,13 @@ class SchedulerState:
 
         if ws := self.decide_worker_rootish_queuing_enabled():
             self.queued.discard(ts)
+            queued_since = self.queued_since.pop(ts, None)
+            if queued_since is not None:
+                delay = max(0.0, monotonic() - queued_since)
+                self.queue_delay_seconds_total += delay
+                self.queue_delay_samples_total += 1
+                self.queue_delay_max = max(self.queue_delay_max, delay)
+                self.digest_metric("scheduler-queue-delay", delay)
             return self._add_to_processing(ts, ws, stimulus_id=stimulus_id)
         # If no worker, task just stays `queued`
         return {}, {}, {}
@@ -3965,6 +4025,7 @@ class Scheduler(SchedulerState, ServerNode):
 
         worker_handlers = {
             "task-finished": self.handle_task_finished,
+            "task-finished-batch": self.handle_task_finished_batch,
             "task-erred": self.handle_task_erred,
             "release-worker-data": self.release_worker_data,
             "add-keys": self.add_keys,
@@ -5231,6 +5292,7 @@ class Scheduler(SchedulerState, ServerNode):
         )
         if slots_available == 0:
             return
+        self.queue_slots_opened_total += slots_available
 
         for _ in range(slots_available):
             if not self.queued:
@@ -5246,6 +5308,7 @@ class Scheduler(SchedulerState, ServerNode):
 
             # This removes the task from the top of the self.queued heap
             self.transitions({qts.key: "processing"}, stimulus_id)
+            self.queued_tasks_dispatched_total += 1
             if self.validate:
                 assert qts.state == "processing"
                 assert not self.queued or self.queued.peek() != qts
@@ -6029,10 +6092,59 @@ class Scheduler(SchedulerState, ServerNode):
                 cleanup_delay, remove_client_from_events
             )
 
+    def _record_compute_task_dispatches(
+        self, worker: str, task_msgs: list[dict[str, Any]], *, messages_sent: int
+    ) -> None:
+        self.compute_task_messages_total += messages_sent
+        self.compute_task_dispatches_total += len(task_msgs)
+        for msg in task_msgs:
+            who_has = msg.get("who_has", {})
+            if not who_has or all(worker in workers for workers in who_has.values()):
+                self.compute_task_locality_hits_total += 1
+
+    def _pack_worker_messages(
+        self, worker: str, msgs: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        packed: list[dict[str, Any]] = []
+        pending_compute: list[dict[str, Any]] = []
+
+        def flush_compute() -> None:
+            if not pending_compute:
+                return
+            if self.compute_task_batch_enabled and len(pending_compute) > 1:
+                packed.append(
+                    {
+                        "op": "compute-task-batch",
+                        "tasks": pending_compute.copy(),
+                    }
+                )
+                self._record_compute_task_dispatches(
+                    worker, pending_compute, messages_sent=1
+                )
+            else:
+                packed.extend(pending_compute)
+                self._record_compute_task_dispatches(
+                    worker,
+                    pending_compute,
+                    messages_sent=len(pending_compute),
+                )
+            pending_compute.clear()
+
+        for msg in msgs:
+            if msg.get("op") == "compute-task":
+                pending_compute.append(msg)
+            else:
+                flush_compute()
+                packed.append(msg)
+
+        flush_compute()
+        return packed
+
     def send_task_to_worker(self, worker: str, ts: TaskState) -> None:
         """Send a single computational task to a worker"""
         try:
             msg = self._task_to_msg(ts)
+            self._record_compute_task_dispatches(worker, [msg], messages_sent=1)
             self.worker_send(worker, msg)
         except Exception as e:
             logger.exception(e)
@@ -6053,6 +6165,8 @@ class Scheduler(SchedulerState, ServerNode):
         if self.validate:
             self.validate_key(key)
 
+        self.task_finished_messages_total += 1
+        self.task_finished_tasks_total += 1
         r: tuple = self.stimulus_task_finished(
             key=key, worker=worker, stimulus_id=stimulus_id, **msg
         )
@@ -6060,6 +6174,53 @@ class Scheduler(SchedulerState, ServerNode):
         self._transitions(recommendations, client_msgs, worker_msgs, stimulus_id)
         self.send_all(client_msgs, worker_msgs)
 
+        self.stimulus_queue_slots_maybe_opened(stimulus_id=stimulus_id)
+
+    def handle_task_finished_batch(
+        self,
+        worker: str,
+        tasks: list[dict[str, Any]],
+        stimulus_id: str | None = None,
+        **msg: Any,
+    ) -> None:
+        if worker not in self.workers or not tasks:
+            return
+
+        stimulus_id = stimulus_id or f"task-finished-batch-{time()}"
+        self.task_finished_messages_total += 1
+        self.task_finished_tasks_total += len(tasks)
+
+        client_msgs: Msgs = {}
+        worker_msgs: Msgs = {}
+        for task_msg in tasks:
+            key = task_msg["key"]
+            if self.validate:
+                self.validate_key(key)
+
+            per_task_msg = {
+                k: v
+                for k, v in task_msg.items()
+                if k not in {"key", "op", "stimulus_id"}
+            }
+            task_stimulus_id = task_msg.get("stimulus_id", stimulus_id)
+            recommendations, task_client_msgs, task_worker_msgs = self.stimulus_task_finished(
+                key=key,
+                worker=worker,
+                stimulus_id=task_stimulus_id,
+                **per_task_msg,
+            )
+            for client, msgs in task_client_msgs.items():
+                client_msgs.setdefault(client, []).extend(msgs)
+            for worker_addr, msgs in task_worker_msgs.items():
+                worker_msgs.setdefault(worker_addr, []).extend(msgs)
+            self._transitions(
+                recommendations,
+                client_msgs,
+                worker_msgs,
+                task_stimulus_id,
+            )
+
+        self.send_all(client_msgs, worker_msgs)
         self.stimulus_queue_slots_maybe_opened(stimulus_id=stimulus_id)
 
     def handle_task_erred(self, key: Key, stimulus_id: str, **msg: Any) -> None:
@@ -6373,7 +6534,8 @@ class Scheduler(SchedulerState, ServerNode):
         for worker, msgs in worker_msgs.items():
             try:
                 w = self.stream_comms[worker]
-                w.send(*msgs)
+                packed_msgs = self._pack_worker_messages(worker, msgs)
+                w.send(*packed_msgs)
             except KeyError:
                 # worker already gone
                 pass

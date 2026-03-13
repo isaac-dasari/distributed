@@ -98,6 +98,28 @@ async def test_worker_nthreads(s):
         assert w.executor._max_workers == CPU_COUNT
 
 
+@gen_cluster(
+    client=True,
+    nthreads=[("", 1)],
+    config={
+        "distributed.worker.batching.task-finished": True,
+        "distributed.worker.batching.task-finished-size": 4,
+        "distributed.worker.batching.task-finished-interval": "100ms",
+    },
+)
+async def test_task_finished_batch_wire_message(c, s, a):
+    with freeze_batched_send(a.batched_stream) as locked_comm:
+        futures = c.map(slowinc, range(4), delay=0.05, pure=False)
+        await async_poll_for(lambda: not locked_comm.write_queue.empty(), timeout=5)
+        _, payload = await locked_comm.write_queue.get()
+        assert any(
+            msg["op"] == "task-finished-batch" and len(msg["tasks"]) > 1
+            for msg in payload
+        )
+        locked_comm.write_event.set()
+        await wait(futures)
+
+
 @gen_cluster()
 async def test_str(s, a, b):
     assert a.address in str(a)

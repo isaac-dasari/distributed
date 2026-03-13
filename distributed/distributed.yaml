@@ -36,6 +36,8 @@ distributed:
       split-shuffle: 1us
       split-taskshuffle: 1us
       split-stage: 1us
+    batching:
+      compute: False
     validate: False         # Check scheduler state at every step for debugging
     dashboard:
       status:
@@ -97,6 +99,10 @@ distributed:
     preload: []             # Run custom modules with Worker
     preload-argv: []        # See https://docs.dask.org/en/latest/how-to/customize-initialization.html
     daemon: True
+    batching:
+      task-finished: False
+      task-finished-size: 8
+      task-finished-interval: 2ms
     validate: False         # Check worker state at every step for debugging
     resources: {}           # Key: value pairs specifying worker resources.
     lifetime:

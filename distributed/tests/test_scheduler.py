@@ -104,6 +104,27 @@ async def test_administration(s, a, b):
     assert str(len(s.workers)) in repr(s)
 
 
+@gen_cluster(
+    client=True,
+    nthreads=[("", 1)],
+    config={
+        "distributed.scheduler.batching.compute": True,
+        "distributed.scheduler.worker-saturation": "inf",
+    },
+)
+async def test_compute_task_batch_wire_message(c, s, a):
+    with freeze_batched_send(s.stream_comms[a.address]) as locked_comm:
+        futures = c.map(slowinc, range(8), delay=0.05, pure=False)
+        await async_poll_for(lambda: not locked_comm.write_queue.empty(), timeout=5)
+        _, payload = await locked_comm.write_queue.get()
+        assert any(
+            msg["op"] == "compute-task-batch" and len(msg["tasks"]) > 1
+            for msg in payload
+        )
+        locked_comm.write_event.set()
+        await wait(futures)
+
+
 @gen_cluster(client=True, nthreads=[("127.0.0.1", 1)])
 async def test_respect_data_in_memory(c, s, a):
     x = delayed(inc)(1, dask_key_name="x")

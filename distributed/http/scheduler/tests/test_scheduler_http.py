@@ -129,6 +129,17 @@ async def test_prometheus(c, s, a, b):
         "dask_scheduler_task_groups",
         "dask_scheduler_prefix_state_totals",
         "dask_scheduler_tick_count",
+        "dask_scheduler_transitions",
+        "dask_scheduler_queue_slots_opened",
+        "dask_scheduler_queued_tasks_dispatched",
+        "dask_scheduler_compute_task_messages",
+        "dask_scheduler_compute_task_dispatches",
+        "dask_scheduler_compute_task_locality_hits",
+        "dask_scheduler_task_finished_messages",
+        "dask_scheduler_task_finished_tasks",
+        "dask_scheduler_queue_delay_seconds",
+        "dask_scheduler_queue_delay_samples",
+        "dask_scheduler_queue_delay_maximum_seconds",
         "dask_scheduler_tick_duration_maximum_seconds",
         "dask_scheduler_gc_collection_seconds",
     }
@@ -147,6 +158,58 @@ async def test_prometheus(c, s, a, b):
     # request data twice since there once was a case where metrics got registered multiple times resulting in
     # prometheus_client errors
     await fetch_metrics(s.http_server.port, "dask_scheduler_")
+
+
+@gen_cluster(client=True)
+async def test_prometheus_scheduler_control_path_counters(c, s, a, b):
+    pytest.importorskip("prometheus_client")
+
+    futures = [c.submit(slowinc, i, delay=0.2) for i in range(8)]
+    await async_poll_for(lambda: s.compute_task_messages_total >= len(futures), timeout=5)
+
+    families = await fetch_metrics(s.http_server.port, prefix="dask_scheduler_")
+    assert families["dask_scheduler_queue_slots_opened"].samples[0].value >= 0
+    assert families["dask_scheduler_queued_tasks_dispatched"].samples[0].value >= 0
+    assert families["dask_scheduler_compute_task_messages"].samples[0].value >= len(futures)
+    assert families["dask_scheduler_compute_task_dispatches"].samples[0].value >= len(futures)
+    assert families["dask_scheduler_compute_task_locality_hits"].samples[0].value >= 0
+    await wait(futures)
+
+    families = await fetch_metrics(s.http_server.port, prefix="dask_scheduler_")
+    assert families["dask_scheduler_transitions"].samples[0].value >= 1
+    assert families["dask_scheduler_task_finished_messages"].samples[0].value >= len(futures)
+    assert families["dask_scheduler_task_finished_tasks"].samples[0].value >= len(futures)
+    assert families["dask_scheduler_queue_delay_seconds"].samples[0].value >= 0
+    assert families["dask_scheduler_queue_delay_samples"].samples[0].value >= 0
+    assert families["dask_scheduler_queue_delay_maximum_seconds"].samples[0].value >= 0
+
+
+@gen_cluster(
+    client=True,
+    nthreads=[("", 1)],
+    config={
+        "distributed.scheduler.batching.compute": True,
+        "distributed.scheduler.worker-saturation": "inf",
+        "distributed.worker.batching.task-finished": True,
+        "distributed.worker.batching.task-finished-size": 4,
+        "distributed.worker.batching.task-finished-interval": "100ms",
+    },
+)
+async def test_prometheus_scheduler_batched_control_path_counters(c, s, a):
+    pytest.importorskip("prometheus_client")
+
+    futures = c.map(slowinc, range(8), delay=0.05, pure=False)
+    await wait(futures)
+    await async_poll_for(lambda: s.task_finished_messages_total >= 1, timeout=5)
+
+    families = await fetch_metrics(s.http_server.port, prefix="dask_scheduler_")
+    compute_messages = families["dask_scheduler_compute_task_messages"].samples[0].value
+    compute_dispatches = families["dask_scheduler_compute_task_dispatches"].samples[0].value
+    finished_messages = families["dask_scheduler_task_finished_messages"].samples[0].value
+    finished_tasks = families["dask_scheduler_task_finished_tasks"].samples[0].value
+
+    assert compute_messages < compute_dispatches
+    assert finished_messages < finished_tasks
 
 
 @pytest.fixture

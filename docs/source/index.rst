@@ -133,3 +133,6 @@ Contents
    protocol
    serialization
    plugins
+   hybrid-scheduling
+   hybrid-scheduling-roadmap
+   hybrid-scheduling-research
