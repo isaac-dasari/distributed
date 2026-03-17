@@ -219,6 +219,60 @@ properties:
                   Whether to pack multiple compute-task messages for the same worker
                   into a single semantic compute-task-batch message.
 
+          fast-path:
+            type: object
+            description: |
+              Configuration for the scheduler-side tiny-task fast path.
+            properties:
+              enabled:
+                type: boolean
+                description: |
+                  Whether to enable the scheduler fast path for tiny, unrestricted
+                  tasks with immediate local-or-empty dependency placement.
+              duration:
+                type: string
+                description: |
+                  Maximum estimated task duration eligible for the tiny-task fast
+                  path.
+
+          lease:
+            type: object
+            description: |
+              Configuration for bounded single-worker scheduler leases.
+            properties:
+              enabled:
+                type: boolean
+                description: |
+                  Whether to allow the scheduler to issue a bounded single-worker
+                  lease for queued tiny tasks.
+              task-budget:
+                type: integer
+                minimum: 1
+                description: |
+                  Maximum number of tasks bundled into a single-worker lease.
+              duration:
+                type: string
+                description: |
+                  Lease duration metadata attached to a single-worker lease batch.
+
+          local-successor:
+            type: object
+            description: |
+              Configuration for retaining tiny direct successors on the same
+              worker after leased task completion.
+            properties:
+              enabled:
+                type: boolean
+                description: |
+                  Whether to allow the scheduler to keep tiny direct successors on
+                  the same worker that finished a leased task.
+              task-budget:
+                type: integer
+                minimum: 1
+                description: |
+                  Maximum number of tiny direct successors retained locally per
+                  finished task.
+
           validate:
             type: boolean
             description: |

@@ -125,6 +125,107 @@ async def test_compute_task_batch_wire_message(c, s, a):
         await wait(futures)
 
 
+@gen_cluster(
+    client=True,
+    nthreads=[("", 1)],
+    config={
+        "distributed.scheduler.fast-path.enabled": True,
+        "distributed.scheduler.fast-path.duration": "10ms",
+        "distributed.scheduler.default-task-durations": {"inc": "1ms"},
+    },
+)
+async def test_tiny_task_fastpath_counter(c, s, a):
+    futures = c.map(inc, range(8), pure=False)
+    await wait(futures)
+    assert s.tiny_fastpath_tasks_total > 0
+
+
+@gen_cluster(
+    client=True,
+    nthreads=[("", 1)],
+    config={
+        "distributed.scheduler.fast-path.enabled": True,
+        "distributed.scheduler.fast-path.duration": "10ms",
+        "distributed.scheduler.default-task-durations": {"inc": "1ms"},
+    },
+)
+async def test_tiny_task_fastpath_rejects_worker_restrictions(c, s, a):
+    future = c.submit(
+        inc,
+        1,
+        pure=False,
+        workers=[a.address],
+        allow_other_workers=False,
+    )
+    await wait([future])
+    assert s.tiny_fastpath_tasks_total == 0
+
+
+@gen_cluster(
+    client=True,
+    nthreads=[("", 1)],
+    config={
+        "distributed.scheduler.fast-path.enabled": True,
+        "distributed.scheduler.fast-path.duration": "10ms",
+        "distributed.scheduler.lease.enabled": True,
+        "distributed.scheduler.lease.task-budget": 4,
+        "distributed.scheduler.lease.duration": "10ms",
+        "distributed.scheduler.worker-saturation": 1.0,
+        "distributed.scheduler.default-task-durations": {"inc": "1ms"},
+    },
+)
+async def test_single_worker_lease_counters(c, s, a):
+    futures = c.map(inc, range(32), pure=False)
+    await wait(futures)
+    assert s.single_worker_leases_issued_total > 0
+    assert s.single_worker_lease_tasks_total > 1
+    assert a.received_leases_total > 0
+    assert a.received_lease_tasks_total > 1
+
+
+@gen_cluster(
+    client=True,
+    nthreads=[("", 1)],
+    config={
+        "distributed.scheduler.fast-path.enabled": True,
+        "distributed.scheduler.fast-path.duration": "10ms",
+        "distributed.scheduler.lease.enabled": True,
+        "distributed.scheduler.lease.task-budget": 8,
+        "distributed.scheduler.lease.duration": "10ms",
+        "distributed.scheduler.default-task-durations": {"inc": "1ms"},
+    },
+)
+async def test_single_worker_lease_fallback_does_not_strand_tasks(c, s, a):
+    futures = c.map(inc, range(200), pure=False)
+    await wait_for(asyncio.shield(wait(futures)), timeout=10)
+    assert all(ts.state == "memory" for ts in s.tasks.values())
+
+
+@gen_cluster(
+    client=True,
+    nthreads=[("", 1)],
+    config={
+        "distributed.scheduler.fast-path.enabled": True,
+        "distributed.scheduler.fast-path.duration": "10ms",
+        "distributed.scheduler.lease.enabled": True,
+        "distributed.scheduler.lease.task-budget": 8,
+        "distributed.scheduler.lease.duration": "10ms",
+        "distributed.scheduler.worker-saturation": 2.0,
+        "distributed.scheduler.local-successor.enabled": True,
+        "distributed.scheduler.local-successor.task-budget": 2,
+        "distributed.scheduler.default-task-durations": {"inc": "1ms"},
+    },
+)
+async def test_local_successor_counter(c, s, a):
+    roots = c.map(inc, range(64), pure=False)
+    mids = c.map(inc, roots, pure=False)
+    finals = c.map(inc, mids, pure=False)
+    await wait(finals)
+    await async_poll_for(lambda: s.local_successor_tasks_total > 0, timeout=5)
+    assert s.single_worker_leases_issued_total > 0
+    assert s.local_successor_tasks_total > 0
+
+
 @gen_cluster(client=True, nthreads=[("127.0.0.1", 1)])
 async def test_respect_data_in_memory(c, s, a):
     x = delayed(inc)(1, dask_key_name="x")

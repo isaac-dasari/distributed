@@ -109,6 +109,15 @@ dask_scheduler_task_finished_messages_total
     Total number of ``task-finished`` messages handled by the scheduler
 dask_scheduler_task_finished_tasks_total
     Total number of completed tasks handled by the scheduler
+dask_scheduler_tiny_fastpath_tasks_total
+    Total number of tasks dispatched through the scheduler tiny-task fast path
+dask_scheduler_single_worker_leases_issued_total
+    Total number of bounded single-worker leases issued by the scheduler
+dask_scheduler_single_worker_lease_tasks_total
+    Total number of tasks dispatched through bounded single-worker leases
+dask_scheduler_local_successor_tasks_total
+    Total number of tiny successors retained on the same worker after leased
+    task completion
 dask_scheduler_queue_delay_seconds_total
     Total cumulative time tasks spent waiting in the scheduler queue
 dask_scheduler_queue_delay_samples_total

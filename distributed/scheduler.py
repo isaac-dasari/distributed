@@ -1755,6 +1755,39 @@ class SchedulerState:
     #: Whether semantic compute-task batching is enabled
     compute_task_batch_enabled: bool
 
+    #: Whether the tiny-task scheduler fast path is enabled
+    tiny_task_fastpath_enabled: bool
+
+    #: Maximum estimated task duration for the tiny-task scheduler fast path
+    tiny_task_fastpath_duration: float
+
+    #: Total number of tasks dispatched through the tiny-task scheduler fast path
+    tiny_fastpath_tasks_total: int
+
+    #: Whether single-worker leases are enabled
+    single_worker_lease_enabled: bool
+
+    #: Maximum number of tasks issued in a single-worker lease
+    single_worker_lease_task_budget: int
+
+    #: Lease duration metadata attached to a single-worker lease
+    single_worker_lease_duration: float
+
+    #: Total number of single-worker leases issued
+    single_worker_leases_issued_total: int
+
+    #: Total number of tasks issued through single-worker leases
+    single_worker_lease_tasks_total: int
+
+    #: Whether local successor placement is enabled
+    local_successor_enabled: bool
+
+    #: Maximum number of tiny successors retained locally per finished task
+    local_successor_task_budget: int
+
+    #: Total number of tiny successors retained locally on the same worker
+    local_successor_tasks_total: int
+
     #: Raise an error if the :attr:`transition_counter` ever reaches this value.
     #: This is meant for debugging only, to catch infinite recursion loops.
     #: In production, it should always be set to False.
@@ -1856,6 +1889,32 @@ class SchedulerState:
         self.compute_task_batch_enabled = dask.config.get(
             "distributed.scheduler.batching.compute"
         )
+        self.tiny_task_fastpath_enabled = dask.config.get(
+            "distributed.scheduler.fast-path.enabled"
+        )
+        self.tiny_task_fastpath_duration = parse_timedelta(
+            dask.config.get("distributed.scheduler.fast-path.duration")
+        )
+        self.tiny_fastpath_tasks_total = 0
+        self.single_worker_lease_enabled = dask.config.get(
+            "distributed.scheduler.lease.enabled"
+        )
+        self.single_worker_lease_task_budget = dask.config.get(
+            "distributed.scheduler.lease.task-budget"
+        )
+        self.single_worker_lease_duration = parse_timedelta(
+            dask.config.get("distributed.scheduler.lease.duration")
+        )
+        self.single_worker_leases_issued_total = 0
+        self.single_worker_lease_tasks_total = 0
+        self.local_successor_enabled = dask.config.get(
+            "distributed.scheduler.local-successor.enabled"
+        )
+        self.local_successor_task_budget = dask.config.get(
+            "distributed.scheduler.local-successor.task-budget"
+        )
+        self.local_successor_tasks_total = 0
+        self.leased_task_workers: dict[Key, str] = {}
         self.transition_counter_max = transition_counter_max
 
         # Variables from dask.config, cached by __init__ for performance
@@ -2263,6 +2322,10 @@ class SchedulerState:
             assert not ts.actor, f"Actors can't be in `no-worker`: {ts}"
             assert ts in self.unrunnable
 
+        if ws := self.decide_worker_tiny_fastpath(ts):
+            self.tiny_fastpath_tasks_total += 1
+            self.unrunnable.pop(ts, None)
+            return self._add_to_processing(ts, ws, stimulus_id=stimulus_id)
         if ws := self.decide_worker_non_rootish(ts):
             self.unrunnable.pop(ts, None)
             return self._add_to_processing(ts, ws, stimulus_id=stimulus_id)
@@ -2511,13 +2574,192 @@ class SchedulerState:
 
         return ws
 
-    def _transition_waiting_processing(self, key: Key, stimulus_id: str) -> RecsMsgs:
+    def is_tiny_fastpath_candidate(self, ts: TaskState) -> bool:
+        if not self.tiny_task_fastpath_enabled:
+            return False
+        if ts.actor or ts.retries:
+            return False
+        if ts.annotations:
+            return False
+        if ts.worker_restrictions or ts.host_restrictions or ts.resource_restrictions:
+            return False
+        return self._get_prefix_duration(ts.prefix) <= self.tiny_task_fastpath_duration
+
+    def decide_worker_tiny_fastpath(self, ts: TaskState) -> WorkerState | None:
+        if not self.is_tiny_fastpath_candidate(ts):
+            return None
+        if not self.idle_task_count:
+            return None
+
+        candidates = set(self.idle_task_count)
+        if ts.dependencies:
+            local_candidates = set.intersection(
+                *(set(dts.who_has or ()) for dts in ts.dependencies)
+            )
+            candidates &= local_candidates
+            if not candidates:
+                return None
+
+        ws = min(candidates, key=partial(self.worker_objective, ts))
+        if self.validate:
+            assert self.workers.get(ws.address) is ws
+            assert ws in self.running, (ws, self.running)
+            assert not _worker_full(ws, self.WORKER_SATURATION), (
+                ws,
+                _task_slots_available(ws, self.WORKER_SATURATION),
+            )
+        return ws
+
+    def is_single_worker_lease_candidate(
+        self, ts: TaskState, ws: WorkerState
+    ) -> bool:
+        return self.is_tiny_fastpath_candidate(ts) and (
+            not ts.dependencies or all(ws in (dts.who_has or ()) for dts in ts.dependencies)
+        )
+
+    def _record_single_worker_lease(
+        self, worker: str, lease_msg: dict[str, Any]
+    ) -> None:
+        tasks = cast("list[dict[str, Any]]", lease_msg["tasks"])
+        self.single_worker_leases_issued_total += 1
+        self.single_worker_lease_tasks_total += len(tasks)
+        for task in tasks:
+            self.leased_task_workers[task["key"]] = worker
+        self._record_compute_task_dispatches(worker, tasks, messages_sent=1)
+
+    def is_local_successor_candidate(self, ts: TaskState, ws: WorkerState) -> bool:
+        return self.local_successor_enabled and self.is_tiny_fastpath_candidate(ts) and (
+            not ts.dependencies or all(ws in (dts.who_has or ()) for dts in ts.dependencies)
+        )
+
+    def maybe_promote_local_successors(
+        self,
+        ts: TaskState,
+        worker: str,
+        recommendations: Recs,
+        stimulus_id: str,
+    ) -> tuple[Msgs, Msgs]:
+        leased_worker = self.leased_task_workers.pop(ts.key, None)
+        if leased_worker != worker:
+            return {}, {}
+
+        ws = self.workers.get(worker)
+        if ws is None or _worker_full(ws, self.WORKER_SATURATION):
+            return {}, {}
+
+        client_msgs: Msgs = {}
+        worker_msgs: Msgs = {}
+        promoted = 0
+        dependents = list(ts.dependents)
+        if len(dependents) > 1:
+            dependents.sort(key=operator.attrgetter("priority"), reverse=True)
+
+        for dts in dependents:
+            if promoted >= self.local_successor_task_budget:
+                break
+            if recommendations.get(dts.key) != "processing":
+                continue
+            if dts.state != "waiting" or not self.is_local_successor_candidate(dts, ws):
+                continue
+
+            recommendations.pop(dts.key, None)
+            new_recommendations, new_client_msgs, new_worker_msgs = self._transition(
+                dts.key,
+                "processing",
+                stimulus_id,
+                worker=worker,
+            )
+            self._transitions(
+                new_recommendations, client_msgs, worker_msgs, stimulus_id
+            )
+            for client, msgs in new_client_msgs.items():
+                client_msgs.setdefault(client, []).extend(msgs)
+            for worker_addr, msgs in new_worker_msgs.items():
+                worker_msgs.setdefault(worker_addr, []).extend(msgs)
+            self.leased_task_workers[dts.key] = worker
+            promoted += 1
+
+        self.local_successor_tasks_total += promoted
+        return client_msgs, worker_msgs
+
+    def maybe_issue_single_worker_lease(
+        self, qts: TaskState, stimulus_id: str
+    ) -> tuple[int, Msgs, Msgs]:
+        if not self.single_worker_lease_enabled:
+            return 0, {}, {}
+        if not self.idle_task_count:
+            return 0, {}, {}
+
+        ws = self.decide_worker_rootish_queuing_enabled()
+        if ws is None or not self.is_single_worker_lease_candidate(qts, ws):
+            return 0, {}, {}
+
+        candidates = []
+        for candidate in self.queued.sorted():
+            if len(candidates) >= self.single_worker_lease_task_budget:
+                break
+            if not self.is_single_worker_lease_candidate(candidate, ws):
+                break
+            candidates.append(candidate)
+
+        if len(candidates) <= 1:
+            return 0, {}, {}
+
+        client_msgs: Msgs = {}
+        worker_msgs: Msgs = {}
+        lease_task_msgs: list[dict[str, Any]] = []
+        lease_id = f"lease-{time()}"
+
+        for candidate in candidates:
+            recommendations, new_cmsgs, new_wmsgs = self._transition(
+                candidate.key,
+                "processing",
+                stimulus_id,
+                worker=ws.address,
+            )
+            self._transitions(recommendations, client_msgs, worker_msgs, stimulus_id)
+            for client, msgs in new_cmsgs.items():
+                client_msgs.setdefault(client, []).extend(msgs)
+            for worker_addr, msgs in new_wmsgs.items():
+                worker_msgs.setdefault(worker_addr, []).extend(msgs)
+
+        lease_worker_msgs = cast("list[dict[str, Any]]", worker_msgs.pop(ws.address, []))
+        lease_task_msgs = [msg for msg in lease_worker_msgs if msg.get("op") == "compute-task"]
+        passthrough_msgs = [msg for msg in lease_worker_msgs if msg.get("op") != "compute-task"]
+        if passthrough_msgs:
+            worker_msgs[ws.address] = passthrough_msgs
+        if not lease_task_msgs:
+            return 0, client_msgs, worker_msgs
+
+        lease_msg = {
+            "op": "compute-task-lease",
+            "lease_id": lease_id,
+            "lease_deadline": time() + self.single_worker_lease_duration,
+            "tasks": lease_task_msgs,
+        }
+        worker_msgs.setdefault(ws.address, []).append(lease_msg)
+        self._record_single_worker_lease(ws.address, lease_msg)
+        return len(candidates), client_msgs, worker_msgs
+
+    def _transition_waiting_processing(
+        self, key: Key, stimulus_id: str, worker: str | None = None
+    ) -> RecsMsgs:
         """Possibly schedule a ready task. This is the primary dispatch for ready tasks.
 
         If there's no appropriate worker for the task (but the task is otherwise
         runnable), it will be recommended to ``no-worker`` or ``queued``.
         """
         ts = self.tasks[key]
+
+        if worker is not None:
+            ws = self.workers.get(worker)
+            if ws is None:
+                return {ts.key: "no-worker"}, {}, {}
+            return self._add_to_processing(ts, ws, stimulus_id=stimulus_id)
+
+        if ws := self.decide_worker_tiny_fastpath(ts):
+            self.tiny_fastpath_tasks_total += 1
+            return self._add_to_processing(ts, ws, stimulus_id=stimulus_id)
 
         if self.is_rootish(ts):
             # NOTE: having two root-ish methods is temporary. When the feature flag is
@@ -3015,12 +3257,28 @@ class SchedulerState:
         self._propagate_released(ts, recommendations)
         return recommendations, {}, {}
 
-    def _transition_queued_processing(self, key: Key, stimulus_id: str) -> RecsMsgs:
+    def _transition_queued_processing(
+        self, key: Key, stimulus_id: str, worker: str | None = None
+    ) -> RecsMsgs:
         ts = self.tasks[key]
 
         if self.validate:
             assert not ts.actor, f"Actors can't be queued: {ts}"
             assert ts in self.queued
+
+        if worker is not None:
+            ws = self.workers.get(worker)
+            if ws is None:
+                return {ts.key: "no-worker"}, {}, {}
+            self.queued.discard(ts)
+            queued_since = self.queued_since.pop(ts, None)
+            if queued_since is not None:
+                delay = max(0.0, monotonic() - queued_since)
+                self.queue_delay_seconds_total += delay
+                self.queue_delay_samples_total += 1
+                self.queue_delay_max = max(self.queue_delay_max, delay)
+                self.digest_metric("scheduler-queue-delay", delay)
+            return self._add_to_processing(ts, ws, stimulus_id=stimulus_id)
 
         if ws := self.decide_worker_rootish_queuing_enabled():
             self.queued.discard(ts)
@@ -5293,10 +5551,12 @@ class Scheduler(SchedulerState, ServerNode):
         if slots_available == 0:
             return
         self.queue_slots_opened_total += slots_available
+        client_msgs: Msgs = {}
+        worker_msgs: Msgs = {}
 
         for _ in range(slots_available):
             if not self.queued:
-                return
+                break
             # Ideally, we'd be popping it here already but this would break
             # certain state invariants since the task is not transitioned, yet
             qts = self.queued.peek()
@@ -5306,12 +5566,31 @@ class Scheduler(SchedulerState, ServerNode):
                 assert not qts.waiting_on, (qts, qts.processing_on)
                 assert qts.who_wants or qts.waiters, qts
 
-            # This removes the task from the top of the self.queued heap
-            self.transitions({qts.key: "processing"}, stimulus_id)
+            lease_count, lease_client_msgs, lease_worker_msgs = (
+                self.maybe_issue_single_worker_lease(qts, stimulus_id)
+            )
+            if lease_count:
+                self.queued_tasks_dispatched_total += lease_count
+                for client, msgs in lease_client_msgs.items():
+                    client_msgs.setdefault(client, []).extend(msgs)
+                for worker, msgs in lease_worker_msgs.items():
+                    worker_msgs.setdefault(worker, []).extend(msgs)
+                continue
+
+            recommendations, new_client_msgs, new_worker_msgs = self._transition(
+                qts.key, "processing", stimulus_id
+            )
+            self._transitions(recommendations, client_msgs, worker_msgs, stimulus_id)
+            for client, msgs in new_client_msgs.items():
+                client_msgs.setdefault(client, []).extend(msgs)
+            for worker, msgs in new_worker_msgs.items():
+                worker_msgs.setdefault(worker, []).extend(msgs)
             self.queued_tasks_dispatched_total += 1
             if self.validate:
                 assert qts.state == "processing"
                 assert not self.queued or self.queued.peek() != qts
+
+        self.send_all(client_msgs, worker_msgs)
 
     def stimulus_task_finished(
         self, key: Key, worker: str, stimulus_id: str, run_id: int, **kwargs: Any
@@ -5372,13 +5651,26 @@ class Scheduler(SchedulerState, ServerNode):
             else:
                 recommendations[ts.key] = "released"
         elif ts.state == "memory":
+            self.leased_task_workers.pop(key, None)
             self.add_keys(worker=worker, keys=[key])
         else:
             if kwargs["metadata"]:
                 if ts.metadata is None:
                     ts.metadata = dict()
                 ts.metadata.update(kwargs["metadata"])
-            return self._transition(key, "memory", stimulus_id, worker=worker, **kwargs)
+            recommendations, client_msgs, worker_msgs = self._transition(
+                key, "memory", stimulus_id, worker=worker, **kwargs
+            )
+            successor_client_msgs, successor_worker_msgs = (
+                self.maybe_promote_local_successors(
+                    ts, worker, recommendations, stimulus_id
+                )
+            )
+            for client, msgs in successor_client_msgs.items():
+                client_msgs.setdefault(client, []).extend(msgs)
+            for worker_addr, msgs in successor_worker_msgs.items():
+                worker_msgs.setdefault(worker_addr, []).extend(msgs)
+            return recommendations, client_msgs, worker_msgs
 
         return recommendations, client_msgs, worker_msgs
 
@@ -5398,6 +5690,8 @@ class Scheduler(SchedulerState, ServerNode):
         ts = self.tasks.get(key)
         if ts is None or ts.state != "processing":
             return {}, {}, {}
+
+        self.leased_task_workers.pop(key, None)
 
         if ts.run_id != run_id:
             if ts.processing_on and ts.processing_on.address == worker:
@@ -6133,6 +6427,9 @@ class Scheduler(SchedulerState, ServerNode):
         for msg in msgs:
             if msg.get("op") == "compute-task":
                 pending_compute.append(msg)
+            elif msg.get("op") == "compute-task-lease":
+                flush_compute()
+                packed.append(msg)
             else:
                 flush_compute()
                 packed.append(msg)

@@ -258,6 +258,111 @@ Implementation shape:
   ``ComputeTaskEvent`` stimuli
 - the worker buffers ``task-finished`` messages and emits
   ``task-finished-batch``
+
+End-to-end comparison
+~~~~~~~~~~~~~~~~~~~~~
+
+The following commands show the current branch behavior on real benchmark runs
+using ordinary Dask Distributed workloads with different feature combinations.
+
+Baseline, no hybrid features:
+
+.. code-block:: bash
+
+   .venv/bin/python benchmarks/stage0_control_path_benchmark.py \
+     --scenario independent_tiny \
+     --tasks 200
+
+Fast path enabled:
+
+.. code-block:: bash
+
+   .venv/bin/python benchmarks/stage0_control_path_benchmark.py \
+     --scenario independent_tiny \
+     --tasks 200 \
+     --enable-tiny-task-fastpath \
+     --tiny-task-fastpath-duration 10ms
+
+Fast path plus single-worker leases:
+
+.. code-block:: bash
+
+   .venv/bin/python benchmarks/stage0_control_path_benchmark.py \
+     --scenario independent_tiny \
+     --tasks 200 \
+     --n-workers 1 \
+     --threads-per-worker 1 \
+     --enable-tiny-task-fastpath \
+     --tiny-task-fastpath-duration 10ms \
+     --enable-single-worker-leases \
+     --single-worker-lease-task-budget 8 \
+     --single-worker-lease-duration 10ms
+
+Layered tiny graph with local successor retention:
+
+.. code-block:: bash
+
+   .venv/bin/python benchmarks/stage0_control_path_benchmark.py \
+     --scenario layered_tiny \
+     --tasks 64 \
+     --n-workers 1 \
+     --threads-per-worker 1 \
+     --worker-saturation 2.0 \
+     --enable-tiny-task-fastpath \
+     --tiny-task-fastpath-duration 10ms \
+     --enable-single-worker-leases \
+     --single-worker-lease-task-budget 8 \
+     --single-worker-lease-duration 10ms \
+     --enable-local-successor \
+     --local-successor-task-budget 2
+
+Observed results on this branch:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Scenario
+     - Tasks/s
+     - Compute messages
+     - Dispatch batch
+     - Tiny fast-path tasks
+     - Lease tasks
+     - Local successor tasks
+   * - Baseline ``independent_tiny``
+     - ``23.36``
+     - ``200``
+     - ``1.00``
+     - ``0``
+     - ``0``
+     - ``0``
+   * - Fast path ``independent_tiny``
+     - ``25.20``
+     - ``200``
+     - ``1.00``
+     - ``150``
+     - ``0``
+     - ``0``
+   * - Fast path + lease ``independent_tiny``
+     - ``30.31``
+     - ``38``
+     - ``5.26``
+     - ``4``
+     - ``191``
+     - ``0``
+   * - ``layered_tiny`` with local successor
+     - ``114.30``
+     - ``138``
+     - ``1.39``
+     - ``10``
+     - ``62``
+     - ``16``
+
+Interpretation:
+
+- the user-facing Dask API stays unchanged
+- the fast path improves tiny-task admission without changing message shape
+- leases are the strongest current reduction in scheduler dispatch traffic
+- local successor placement activates only on dependency-layered workloads
 - the scheduler accepts ``task-finished-batch`` and replays the existing
   per-task completion state transitions
 
@@ -301,10 +406,104 @@ Exit criteria:
 - p95 latency improvement on tiny tasks
 - no regression in state-machine validation
 
+Current implementation status
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Stage 2 now exists behind scheduler configuration flags.
+
+Scheduler-side flags:
+
+- ``distributed.scheduler.fast-path.enabled``
+- ``distributed.scheduler.fast-path.duration``
+
+Implementation shape:
+
+- the scheduler admits only strict candidates to the fast path:
+  - no actors
+  - no retries
+  - no annotations
+  - no worker, host, or resource restrictions
+  - estimated task duration at or below the configured threshold
+- the scheduler only uses the fast path when an idle worker slot is already
+  available
+- tasks with dependencies are only admitted if at least one currently idle
+  worker already holds all dependencies
+- admitted tasks bypass the heavier worker-decision path and are dispatched
+  directly through the existing ``_add_to_processing()`` flow
+
+Observability:
+
+- Prometheus exposes ``dask_scheduler_tiny_fastpath_tasks_total``
+- the benchmark harness exposes ``tiny_fastpath_tasks_total``
+
+Focused validation:
+
+- scheduler fast-path positive test:
+  ``distributed/tests/test_scheduler.py::test_tiny_task_fastpath_counter``
+- scheduler fast-path restriction gate test:
+  ``distributed/tests/test_scheduler.py::test_tiny_task_fastpath_rejects_worker_restrictions``
+- Prometheus exposure test:
+  ``distributed/http/scheduler/tests/test_scheduler_http.py::test_prometheus_scheduler_tiny_fastpath_counter``
+
+Example benchmark run with Stage 2 enabled:
+
+.. code-block:: bash
+
+   .venv/bin/python benchmarks/stage0_control_path_benchmark.py \
+     --scenario independent_tiny \
+     --tasks 200 \
+     --enable-tiny-task-fastpath \
+     --tiny-task-fastpath-duration 10ms
+
 Stage 3: Single-worker leases
 -----------------------------
 
 Add scheduler-issued short-lived leases for one worker at a time.
+
+Current implementation status:
+
+- Scheduler-side single-worker lease issuance is wired behind
+  ``distributed.scheduler.lease.*`` config.
+- Workers accept ``compute-task-lease`` messages and attribute received leased work.
+- Prometheus counters are exposed for lease issuance and leased task count.
+- Focused unit and Prometheus coverage is passing.
+- The earlier process-based benchmark hang was fixed by making lease formation
+  atomic before transitioning queued tasks to ``processing``.
+- The process-based benchmark harness now completes with Stage 3 enabled.
+
+Focused verification:
+
+- ``distributed/tests/test_scheduler.py::test_single_worker_lease_counters``
+- ``distributed/tests/test_scheduler.py::test_single_worker_lease_fallback_does_not_strand_tasks``
+- ``distributed/http/scheduler/tests/test_scheduler_http.py::test_prometheus_scheduler_single_worker_lease_counters``
+
+Current focused status:
+
+.. code-block:: text
+
+   10 passed
+
+Example benchmark run with Stage 3 enabled:
+
+.. code-block:: bash
+
+   .venv/bin/python benchmarks/stage0_control_path_benchmark.py \
+     --scenario independent_tiny \
+     --tasks 200 \
+     --n-workers 1 \
+     --threads-per-worker 1 \
+     --enable-tiny-task-fastpath \
+     --enable-single-worker-leases \
+     --single-worker-lease-task-budget 8 \
+     --single-worker-lease-duration 10ms
+
+Observed result highlights:
+
+- ``single_worker_leases_issued_total = 28``
+- ``single_worker_lease_tasks_total = 195``
+- ``compute_task_messages_total = 33``
+- ``average_dispatch_batch_size = 6.06``
+- ``tasks_per_s = 56.6``
 
 Scheduler responsibilities:
 
@@ -336,6 +535,52 @@ Stage 4: Local successor placement
 ----------------------------------
 
 Allow a leased worker to retain tiny successors locally under a strict envelope.
+
+Current implementation status:
+
+- Scheduler-side local successor placement is wired behind
+  ``distributed.scheduler.local-successor.*`` config.
+- Placement is strict: direct successors only, tiny-task eligibility only,
+  same-worker only, dependency-local only, and bounded by a per-finish task budget.
+- The scheduler remains authoritative; local successor retention uses explicit
+  scheduler-approved worker placement rather than worker-side autonomous spawning.
+- Prometheus exposes ``dask_scheduler_local_successor_tasks_total``.
+
+Focused verification:
+
+- ``distributed/tests/test_scheduler.py::test_local_successor_counter``
+- ``distributed/http/scheduler/tests/test_scheduler_http.py::test_prometheus_scheduler_local_successor_counter``
+
+Current focused status:
+
+.. code-block:: text
+
+   12 passed
+
+Example benchmark run with Stage 4 enabled:
+
+.. code-block:: bash
+
+   .venv/bin/python benchmarks/stage0_control_path_benchmark.py \
+     --scenario layered_tiny \
+     --tasks 64 \
+     --n-workers 1 \
+     --threads-per-worker 1 \
+     --worker-saturation 2.0 \
+     --enable-tiny-task-fastpath \
+     --enable-single-worker-leases \
+     --single-worker-lease-task-budget 8 \
+     --single-worker-lease-duration 10ms \
+     --enable-local-successor \
+     --local-successor-task-budget 2
+
+Observed result highlights:
+
+- ``single_worker_leases_issued_total = 8``
+- ``single_worker_lease_tasks_total = 62``
+- ``local_successor_tasks_total = 24``
+- ``average_dispatch_batch_size = 1.39``
+- ``tasks_per_s = 111.9``
 
 Requirements:
 

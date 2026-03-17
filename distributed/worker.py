@@ -687,6 +687,10 @@ class Worker(BaseWorker, ServerNode):
         )
         self._task_finished_batch_buffer: list[dict[str, Any]] = []
         self._task_finished_batch_call = None
+        self.active_leases: dict[str, set[str]] = {}
+        self.task_to_lease: dict[str, str] = {}
+        self.received_leases_total = 0
+        self.received_lease_tasks_total = 0
 
         self.plugins = {}
         self._pending_plugins = plugins
@@ -740,6 +744,7 @@ class Worker(BaseWorker, ServerNode):
             "acquire-replicas": self._handle_remote_stimulus(AcquireReplicasEvent),
             "compute-task": self._handle_remote_stimulus(ComputeTaskEvent),
             "compute-task-batch": self._handle_compute_task_batch,
+            "compute-task-lease": self._handle_compute_task_lease,
             "free-keys": self._handle_remote_stimulus(FreeKeysEvent),
             "remove-replicas": self._handle_remote_stimulus(RemoveReplicasEvent),
             "steal-request": self._handle_remote_stimulus(StealRequestEvent),
@@ -1188,6 +1193,16 @@ class Worker(BaseWorker, ServerNode):
         --------
         distributed.worker_state_machine.BaseWorker.batched_send
         """
+        if msg.get("op") == "task-finished":
+            key = msg.get("key")
+            if key in self.task_to_lease:
+                lease_id = self.task_to_lease.pop(key)
+                leased_tasks = self.active_leases.get(lease_id)
+                if leased_tasks is not None:
+                    leased_tasks.discard(key)
+                    if not leased_tasks:
+                        self.active_leases.pop(lease_id, None)
+
         if self.task_finished_batch_enabled and msg.get("op") == "task-finished":
             self._task_finished_batch_buffer.append(msg)
             if len(self._task_finished_batch_buffer) >= self.task_finished_batch_size:
@@ -2001,6 +2016,20 @@ class Worker(BaseWorker, ServerNode):
     ) -> None:
         events = [ComputeTaskEvent(**{k: v for k, v in task.items() if k != "op"}) for task in tasks]
         self.handle_stimulus(*events)
+
+    def _handle_compute_task_lease(
+        self,
+        lease_id: str,
+        tasks: list[dict[str, Any]],
+        lease_deadline: float | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.received_leases_total += 1
+        self.received_lease_tasks_total += len(tasks)
+        self.active_leases[lease_id] = {task["key"] for task in tasks}
+        for task in tasks:
+            self.task_to_lease[task["key"]] = lease_id
+        self._handle_compute_task_batch(tasks, **kwargs)
 
     @fail_hard
     def handle_stimulus(self, *stims: StateMachineEvent) -> None:

@@ -134,5 +134,6 @@ Contents
    serialization
    plugins
    hybrid-scheduling
+   hybrid-scheduling-usage
    hybrid-scheduling-roadmap
    hybrid-scheduling-research

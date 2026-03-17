@@ -272,6 +272,30 @@ class SchedulerMetricCollector(PrometheusCollector):
             value=self.server.queue_delay_samples_total,
         )
 
+        yield CounterMetricFamily(
+            self.build_name("tiny_fastpath_tasks_total"),
+            "Total number of tasks dispatched through the scheduler tiny-task fast path",
+            value=self.server.tiny_fastpath_tasks_total,
+        )
+
+        yield CounterMetricFamily(
+            self.build_name("single_worker_leases_issued_total"),
+            "Total number of bounded single-worker leases issued by the scheduler",
+            value=self.server.single_worker_leases_issued_total,
+        )
+
+        yield CounterMetricFamily(
+            self.build_name("single_worker_lease_tasks_total"),
+            "Total number of tasks dispatched through bounded single-worker leases",
+            value=self.server.single_worker_lease_tasks_total,
+        )
+
+        yield CounterMetricFamily(
+            self.build_name("local_successor_tasks_total"),
+            "Total number of tiny successors retained on the same worker after leased task completion",
+            value=self.server.local_successor_tasks_total,
+        )
+
         yield GaugeMetricFamily(
             self.build_name("queue_delay_maximum_seconds"),
             "Maximum single observed time a task spent in the scheduler queue",

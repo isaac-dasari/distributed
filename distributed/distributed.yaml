@@ -38,6 +38,16 @@ distributed:
       split-stage: 1us
     batching:
       compute: False
+    fast-path:
+      enabled: False
+      duration: 10ms
+    lease:
+      enabled: False
+      task-budget: 8
+      duration: 10ms
+    local-successor:
+      enabled: False
+      task-budget: 4
     validate: False         # Check scheduler state at every step for debugging
     dashboard:
       status:

@@ -139,6 +139,10 @@ async def test_prometheus(c, s, a, b):
         "dask_scheduler_task_finished_tasks",
         "dask_scheduler_queue_delay_seconds",
         "dask_scheduler_queue_delay_samples",
+        "dask_scheduler_tiny_fastpath_tasks",
+        "dask_scheduler_single_worker_leases_issued",
+        "dask_scheduler_single_worker_lease_tasks",
+        "dask_scheduler_local_successor_tasks",
         "dask_scheduler_queue_delay_maximum_seconds",
         "dask_scheduler_tick_duration_maximum_seconds",
         "dask_scheduler_gc_collection_seconds",
@@ -210,6 +214,77 @@ async def test_prometheus_scheduler_batched_control_path_counters(c, s, a):
 
     assert compute_messages < compute_dispatches
     assert finished_messages < finished_tasks
+
+
+@gen_cluster(
+    client=True,
+    nthreads=[("", 1)],
+    config={
+        "distributed.scheduler.fast-path.enabled": True,
+        "distributed.scheduler.fast-path.duration": "10ms",
+        "distributed.scheduler.default-task-durations": {"inc": "1ms"},
+    },
+)
+async def test_prometheus_scheduler_tiny_fastpath_counter(c, s, a):
+    pytest.importorskip("prometheus_client")
+
+    futures = c.map(inc, range(8), pure=False)
+    await wait(futures)
+
+    families = await fetch_metrics(s.http_server.port, prefix="dask_scheduler_")
+    assert families["dask_scheduler_tiny_fastpath_tasks"].samples[0].value > 0
+
+
+@gen_cluster(
+    client=True,
+    nthreads=[("", 1)],
+    config={
+        "distributed.scheduler.fast-path.enabled": True,
+        "distributed.scheduler.fast-path.duration": "10ms",
+        "distributed.scheduler.lease.enabled": True,
+        "distributed.scheduler.lease.task-budget": 4,
+        "distributed.scheduler.lease.duration": "10ms",
+        "distributed.scheduler.worker-saturation": 1.0,
+        "distributed.scheduler.default-task-durations": {"inc": "1ms"},
+    },
+)
+async def test_prometheus_scheduler_single_worker_lease_counters(c, s, a):
+    pytest.importorskip("prometheus_client")
+
+    futures = c.map(inc, range(32), pure=False)
+    await wait(futures)
+
+    families = await fetch_metrics(s.http_server.port, prefix="dask_scheduler_")
+    assert families["dask_scheduler_single_worker_leases_issued"].samples[0].value > 0
+    assert families["dask_scheduler_single_worker_lease_tasks"].samples[0].value > 1
+
+
+@gen_cluster(
+    client=True,
+    nthreads=[("", 1)],
+    config={
+        "distributed.scheduler.fast-path.enabled": True,
+        "distributed.scheduler.fast-path.duration": "10ms",
+        "distributed.scheduler.lease.enabled": True,
+        "distributed.scheduler.lease.task-budget": 8,
+        "distributed.scheduler.lease.duration": "10ms",
+        "distributed.scheduler.worker-saturation": 2.0,
+        "distributed.scheduler.local-successor.enabled": True,
+        "distributed.scheduler.local-successor.task-budget": 2,
+        "distributed.scheduler.default-task-durations": {"inc": "1ms"},
+    },
+)
+async def test_prometheus_scheduler_local_successor_counter(c, s, a):
+    pytest.importorskip("prometheus_client")
+
+    roots = c.map(inc, range(64), pure=False)
+    mids = c.map(inc, roots, pure=False)
+    finals = c.map(inc, mids, pure=False)
+    await wait(finals)
+    await async_poll_for(lambda: s.local_successor_tasks_total > 0, timeout=5)
+
+    families = await fetch_metrics(s.http_server.port, prefix="dask_scheduler_")
+    assert families["dask_scheduler_local_successor_tasks"].samples[0].value > 0
 
 
 @pytest.fixture
